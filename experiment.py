@@ -196,8 +196,8 @@ def eval_epoch(args, model, dataloader, tbwriter=None, scheduler=None):
     
     total_loss, total_samples = 0, 0
     all_pred, all_label = [], []
-    #bar = enumerate(dataloader) if not args.test else enumerate(tqdm(dataloader))
-    bar = enumerate(tqdm(dataloader, desc="evaluating:"))
+    #bar = enumerate(tqdm(dataloader, desc="evaluating:"))
+    bar = enumerate(dataloader)
     for step, data_batch in bar:
         text, label = data_batch
         text, label = text.cuda(), label.cuda()
@@ -244,7 +244,8 @@ def eval_epoch(args, model, dataloader, tbwriter=None, scheduler=None):
 def get_submission(args, model, prefix=""):
     dataloader = get_dataloader(args, usage="test")
     all_pred = []
-    bar = enumerate(tqdm(dataloader, desc="testing:"))
+    #bar = enumerate(tqdm(dataloader, desc="testing:"))
+    bar = enumerate(dataloader)
     for step, data_batch in bar:
         text, label = data_batch
         text, label = text.cuda(), label.cuda()

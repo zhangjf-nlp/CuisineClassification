@@ -26,11 +26,13 @@ def init_config(args_specification=None):
     parser = argparse.ArgumentParser(description="Comment Classification study")
     
     parser.add_argument('--test', action='store_true', default=False)
+    parser.add_argument('--erase', action='store_true', default=False, help="erase the exp-dir if it already exists, otherwise skip this experiment")
+    parser.add_argument('--bias_sampling', action='store_true', default=False, help="use class-equal sampling strategy")
     parser.add_argument('--tiny_experiment', action='store_true', default=False, help="only use a tiny subset to train/eval/test")
     parser.add_argument('--pretrained_model_name_or_path', type=str, default='bert-base-uncased', help="the specified path to load pretrained vae")
     
-    parser.add_argument('--epoch', type=int, default=10)
-    parser.add_argument('--learning_rate', type=float, default=3e-5)
+    parser.add_argument('--epoch', type=int, default=3)
+    parser.add_argument('--learning_rate', type=float, default=1e-4)
     parser.add_argument('--batch_size', type=int, default=32, help="the size of mini-batch in training")
     parser.add_argument('--max_length', type=int, default=100, help="the max length of text tokenization")
     
@@ -60,6 +62,9 @@ def init_config(args_specification=None):
     
     args.model_name = f"{args.pretrained_model_name_or_path}_{args.agg_class}_{args.head_class}"
     
+    if args.bias_sampling:
+        args.model_name += "_bias"
+    
     if args.exp_dir == None:
         args.exp_dir = f"exp/{args.model_name}/{args.epoch}*{args.learning_rate}_per_{args.batch_size}*{args.gradient_accumulation_steps}"
     
@@ -68,7 +73,7 @@ def init_config(args_specification=None):
     torch.cuda.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = True
     
-    args.logging = create_logging(args, save_args=save_args, erase=True)
+    args.logging = create_logging(args, save_args=save_args)
     args.logging(args)
     
     args.head_class = available_head_classes[args.head_class]
@@ -76,7 +81,7 @@ def init_config(args_specification=None):
     
     return args
 
-def create_logging(args, save_args=False, erase=True):
+def create_logging(args, save_args=False):
     import functools, shutil
     def logging(output, log_path, end="\n", do_print=True):
         if do_print:
@@ -85,19 +90,22 @@ def create_logging(args, save_args=False, erase=True):
             with open(log_path, "a+") as logf:
                 logf.write(str(output) + end)
     
+    args.skip_experiment = False
+    
     if args.test:
         return functools.partial(logging, log_path=f"{args.exp_dir}/test_log.txt", do_print=True)
     
     if os.path.exists(args.exp_dir):
-        if erase:
+        if args.erase:
             print(f"Path {args.exp_dir} exists. Remove and remake.")
             shutil.rmtree(args.exp_dir)
             os.makedirs(f"{args.exp_dir}/chkpts")
             os.makedirs(f"{args.exp_dir}/runs")
             return functools.partial(logging, log_path=f"{args.exp_dir}/log.txt")
         else:
-            print(f"Path {args.exp_dir} exists. Log after the existing content.")
-            return functools.partial(logging, log_path=f"{args.exp_dir}/log.txt")
+            print(f"Path {args.exp_dir} exists. Skip this experiment.")
+            args.skip_experiment = True
+            return functools.partial(logging, log_path=None)
     
     print(f"Create new experiment directory: {args.exp_dir}.")
     os.makedirs(f"{args.exp_dir}/chkpts")
@@ -164,7 +172,7 @@ def train_epoch(args, model, train_dataloader, eval_dataloader, train_tbwriter, 
     for step, data_batch in bar:
         text, label = data_batch
         text, label = text.cuda(), label.cuda()
-        loss, pred = model(text, label)
+        loss, pred, logits = model(text, label)
         bar.set_description(f"loss={loss.item():.2f}")
         for name, value in [
             ("loss", loss.item()),
@@ -201,7 +209,7 @@ def eval_epoch(args, model, dataloader, tbwriter=None, scheduler=None):
     for step, data_batch in bar:
         text, label = data_batch
         text, label = text.cuda(), label.cuda()
-        loss, pred = model(text, label)
+        loss, pred, logits = model(text, label)
         total_loss += loss*text.shape[0]
         total_samples += text.shape[0]
         if args.test:
@@ -243,32 +251,30 @@ def eval_epoch(args, model, dataloader, tbwriter=None, scheduler=None):
 @torch.no_grad()
 def get_submission(args, model, prefix=""):
     dataloader = get_dataloader(args, usage="test")
-    all_pred = []
+    all_pred, all_logits = [], []
     #bar = enumerate(tqdm(dataloader, desc="testing:"))
     bar = enumerate(dataloader)
     for step, data_batch in bar:
         text, label = data_batch
         text, label = text.cuda(), label.cuda()
-        loss, pred = model(text, label)
+        loss, pred, logits = model(text, label)
         all_pred.append(pred.cpu().numpy())
+        all_logits.append(logits.cpu().numpy())
     all_pred = np.concatenate(all_pred, axis=0)
+    all_logits = np.concatenate(all_logits, axis=0)
     from data_utils import read_data
     test_data = read_data(path="./data/test.json")
     lines = [f"{a} {all_cuisine[b]}" for a,b in zip(list(test_data.keys()), list(all_pred))]
     with open(f"{args.exp_dir}/{prefix}submission.txt", "w") as f:
         f.write("\n".join(lines))
-        """
-    try:
-        from data.MLHomeworks_client.client import main
-        score = main(ans=lines, verbose=0)
-        print(score)
-    except Exception as e:
-        import traceback
-        print(f'traceback.format_exc():\n{traceback.format_exc()}')"""
+    torch.save(all_logits, f"{args.exp_dir}/{prefix}logits.pt")
 
 if __name__ == "__main__":
     
     args = init_config()
+    
+    if args.skip_experiment:
+        exit()
     
     try:
         args.logging(f"This experiemnt started at: {time.ctime()}")

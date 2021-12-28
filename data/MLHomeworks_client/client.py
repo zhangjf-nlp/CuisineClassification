@@ -1,8 +1,11 @@
 # -*- coding: utf-8 -*-
 import numpy as np
+np.set_printoptions(precision=3)
 import pandas as pd
 import requests
+import torch
 import glob
+import time
 import sys
 import os
 from tqdm import tqdm
@@ -32,6 +35,17 @@ all_cuisine = [
     'vietnamese'
 ]
 
+
+def lines_to_logits(lines):
+    labels = [all_cuisine.index(line.split(" ")[1]) for line in lines]
+    logits = np.eye(len(all_cuisine))[labels]
+    return logits
+
+def logits_to_lines(logits, ids):
+    labels = list(np.argmax(logits, axis=-1))
+    lines = [f"{id} {all_cuisine[label]}" for id,label in zip(ids,labels)]
+    return lines
+
 def file_lines_to_list(path):
     # open txt file lines to a list
     with open(path) as f :
@@ -40,12 +54,16 @@ def file_lines_to_list(path):
     content = [x.strip() for x in content]
     return content
 
-
+global last_post_time
+last_post_time= time.time()
 def main(ip="115.236.52.125", port="4000", sid=SID, token=TOKEN,
          ans=None, problem="FoodPredict_evaluate", verbose=1):
     if verbose: print("正在提交...")
     url = "http://%s:%s/jsonrpc" % (ip, port)
     
+    global last_post_time
+    if time.time() - last_post_time < 1:
+        time.sleep(1)
     payload = {
         "method": problem,
         "params": [ans],
@@ -57,7 +75,7 @@ def main(ip="115.236.52.125", port="4000", sid=SID, token=TOKEN,
         json=payload,
         headers={"token": token, "sid": sid}
     ).json()
-    
+    last_post_time = time.time()
     
     if verbose: print(response)
     if "auth_error" in response:
@@ -70,117 +88,87 @@ def main(ip="115.236.52.125", port="4000", sid=SID, token=TOKEN,
         print("提交文件存在问题，请查看error信息")
         return response["error"]["data"]["message"]
 
-def submission_path_to_df(path):
-    return pd.DataFrame(pd.read_csv(path, header=None, sep=" "))
+def path_to_lines(path):
+    with open(path, "r") as f:
+        content = f.read()
+        lines = content.split("\n")
+        lines = [line for line in lines if len(line)>2]
+    return lines
 
-def df_to_lines(df):
-    return [f"{int(sample_id)} {sample_pred}" for sample_id, sample_pred in [
-        df.iloc[i].values.tolist() for i in range(df.shape[0])
-    ]]
-
-def ensemble_submissions(submission_paths, weights="mean", dfs=None):
-    if dfs is None:
-        return_df = False
-        dfs = [submission_path_to_df(path) for path in submission_paths]
-        # 各个模型得到的输出
-    else:
-        return_df = True
-    
-    df_ensemble = pd.DataFrame()
-    df_ensemble[0] = dfs[0][0]
-    if weights=="mean" or sum(weights)==0:
-        df_ensemble[1] = sum([df[1] for df in dfs]) / len(dfs)
-        # 取平均进行集成
-    elif type(weights)==list:
-        norm = sum(weights)
-        weights = [_/norm for _ in weights]
-        df_ensemble[1] = sum([dfs[i][1]*weights[i] for i in range(len(dfs))])
-    
-    if return_df:
-        return df_to_lines(df_ensemble), df_ensemble
-    else:
-        return df_to_lines(df_ensemble)
+def path_to_logits(path):
+    logits = torch.load(path.replace("submission.txt", "logits.pt"))
+    return logits
 
 class GeneticAlgorithm4Submission:
     def __init__(self, max_iter, num_caches, submission_paths):
         self.max_iter = max_iter
         self.num_caches = num_caches
         self.submission_paths = submission_paths
-        self.best_score = 0
         self.init_test()
     
     def run(self):
         self.update()
         for i in tqdm(range(int(self.max_iter/2), self.max_iter)):
+        #for i in tqdm(range(self.max_iter)):
             seed_decay = (np.cos(np.pi/self.max_iter*i)+1) * 0.2
             p_decay = np.cos(np.pi/self.max_iter*i)+1
             self.iter_step(seed_decay=seed_decay, p_decay=p_decay)
             if i%10==0:
-                print("\n".join([f"{score:.8f}" for df,score in self.caches]))
-        best_lines = df_to_lines(self.caches[0][0])
-        main(ans=best_lines)
+                print("\n".join([f"{weight} - {score:.8f}" for weight,score in self.caches]))
+        main(ans=self.best_lines)
         with open(f"./{self.best_score:.8f}_submission.txt", "w") as f:
-            f.write("\n".join([line for line in best_lines]))
-        self.explain(self.caches[0][0])
+            f.write("\n".join([line for line in self.best_lines]))
+        torch.save(self.bert_logits, f"./{self.best_score:.8f}_logits.pt")
     
     def init_test(self):
-        path_to_df = {path:submission_path_to_df(path) for path in submission_paths}
-        path_scores = [(path,main(ans=df_to_lines(path_to_df[path]), verbose=0)) for path in tqdm(path_to_df)]
+        path_lines = [(path,path_to_lines(path)) for path in self.submission_paths]
+        path_to_lines_ = {path:path_to_lines(path) for path in self.submission_paths}
+        path_scores = [(path,main(ans=lines, verbose=0)) for path,lines in tqdm(path_lines)]
         path_scores = sorted(path_scores, key=lambda x:x[1], reverse=True)
         print("initial scores:")
         for path,score in path_scores:
             print(f"{score:.8f} - {path}")
-        self.caches = [(path_to_df[path], score) for path,score in path_scores if score > 0.9]
-        self.seeds = self.refine(self.caches)
+        eye = np.eye(len(self.submission_paths))
+        self.logitss = np.concatenate([path_to_logits(path)[None,:,:] for path,score in path_scores], axis=0) # logitss: [n_submissions, n_samples, n_classes]
+        self.caches = [(eye[i],score) for i,(path,score) in enumerate(path_scores) if score > 0.75] #(weight,score) weight: [n_submissions]
+        self.seeds = [(eye[i],score) for i,(path,score) in enumerate(path_scores) if score > 0.75] #(weight,score) weight: [n_submissions]
+        
+        self.ids = [line.split(" ")[0] for line in path_lines[0][1]]
         self.best_score = self.caches[0][1]
+        self.bert_logits = np.sum(self.caches[0][0][:,None,None]*self.logitss, axis=0)
+        self.best_lines = logits_to_lines(np.sum(self.caches[0][0][:,None,None]*self.logitss, axis=0), self.ids)
     
     def iter_step(self, seed_decay=1.0, p_decay=1.0):
         for _ in range(5):
             p = 1/(np.log(np.arange(len(self.caches))*p_decay+1)+1)
-            index_df_from_cache = np.random.choice(len(self.caches), 3, p=p/p.sum()).tolist()
-            df_from_cache = [self.caches[i][0] for i in index_df_from_cache]
-            weights_cache = [np.random.normal(1,1) for i in range(len(df_from_cache))]
+            index_weight_from_cache = np.random.choice(len(self.caches), 3, p=p/p.sum()).tolist()
+            weight_from_cache = [self.caches[i][0] for i in index_weight_from_cache]
+            variance_cache = [np.random.normal(1,1) for i in range(len(weight_from_cache))]
             
             p = 1/(np.log(np.arange(len(self.seeds))+1)+1)
-            index_df_from_seed = np.random.choice(len(self.seeds), 3, p=p/p.sum()).tolist()
-            df_from_seed = [self.seeds[i][0] for i in index_df_from_seed]
-            weights_seed = [np.random.normal(0,1)*seed_decay for i in range(len(df_from_seed))]
+            index_weight_from_seed = np.random.choice(len(self.seeds), 3, p=p/p.sum()).tolist()
+            weight_from_seed = [self.seeds[i][0] for i in index_weight_from_seed]
+            variance_seed = [np.random.normal(0,1)*seed_decay for i in range(len(weight_from_seed))]
             
-            lines, df = ensemble_submissions(_, weights=weights_cache+weights_seed, dfs=df_from_cache+df_from_seed)
-            score = main(ans=lines, verbose=0)
+            all_weights = weight_from_cache+weight_from_seed
+            all_variances = variance_cache+variance_seed
+            if sum(all_variances)==0:
+                all_variances = [1 for _ in all_variances]
+            weight = np.sum([weight*variance for weight,variance in zip(all_weights, all_variances)], axis=0) / sum(all_variances)
+            weighted_logits = np.sum(weight[:,None,None]*self.logitss, axis=0)
+            weighted_lines = logits_to_lines(weighted_logits, self.ids)
+            
+            score = main(ans=weighted_lines, verbose=0)
             if score > self.best_score:
                 print(f"update best score: {self.best_score:.8f} -> {score:.8f}")
-                print(f"through: No.{index_df_from_cache+index_df_from_seed} * {weights_cache+weights_seed}")
+                print(f"through: {weight}")
                 self.best_score = score
-            self.caches.append((df, score))
+                self.best_lines = weighted_lines
+            self.caches.append((weight, score))
         self.update()
-    
-    def explain(self, target_df):
-        a = np.array([df[1].tolist() for df,score in self.seeds]).T
-        b = np.array(target_df[1].tolist())
-        weights = np.linalg.solve(a[:len(self.seeds),:],b[:len(self.seeds)])
-        print(f"solution:")
-        for i,(df,score) in enumerate(self.seeds):
-            print(f"{score:.8f} * {weights[i]:.3f}")
-    
-    def refine(self, queue):
-        """ 重排序，队列头部仅保留线性无关组 """
-        full_rank = []
-        to_delete = []
-        for i,(df,score) in enumerate(queue):
-            pred = df[1].to_list()
-            if np.linalg.matrix_rank(np.mat(full_rank+[pred])) == len(full_rank)+1:
-                full_rank += [pred]
-            else:
-                to_delete += [i]
-        if len(to_delete)>0:
-            print(f"to_delete: {to_delete}")
-        to_keep = [i for i in range(len(queue)) if i not in to_delete]
-        return [queue[i] for i in to_keep + to_delete]
     
     def update(self):
         self.caches = sorted(self.caches, key=lambda x:x[1], reverse=True)
-        self.caches = self.refine(self.caches)
         self.caches = self.caches[:self.num_caches]
     
 if __name__ == "__main__":
@@ -234,7 +222,7 @@ if __name__ == "__main__":
         submission_path = sys.argv[1]
         if "GA" in submission_path: # ensemble the submissions under specified path through Genetic Algorithm
             submission_paths = [_ for _ in search_path(sys.argv[2])]
-            GA = GeneticAlgorithm4Submission(max_iter=int(submission_path[2:]), num_caches=24, submission_paths=submission_paths)
+            GA = GeneticAlgorithm4Submission(max_iter=int(submission_path[2:]), num_caches=48, submission_paths=submission_paths)
             GA.run()
             
         elif submission_path.isdigit(): # ensemble the specified submissions through grid search
@@ -264,21 +252,22 @@ if __name__ == "__main__":
         
         elif "submission.txt" not in submission_path: # simply post the submissions under specified path
             path_score = []
-            for _ in search_path(submission_path):
-                import time
+            all_paths = [_ for _ in search_path(submission_path)]
+            for path in tqdm(all_paths):
                 time.sleep(1)
-                with open(_) as f:
-                    lines = f.read().split("\n")
-                score = main(ip, port, sid, token, lines, problem)
-                print(_)
-                print(score)
-                path_score.append((_,score))
-            print("\n".join([str(_) for _ in sorted(path_score, key=lambda x:x[1], reverse=True)]))
+                lines = path_to_lines(path)
+                score = main(ip, port, sid, token, lines, problem, verbose=0)
+                path_score.append((path,score))
+            sorted_path_score = sorted(path_score, key=lambda x:x[1], reverse=True)
+            print("\n".join([str(_) for _ in sorted_path_score]))
+            time.sleep(1)
+            with open(sorted_path_score[0][0]) as f:
+                lines = f.read().split("\n")
+            main(ip, port, sid, token, lines, problem)
         
         else: # simply post the single specified submission
-            with open(submission_path) as f:
-                d = list(f.readlines())
-            score = main(ip, port, sid, token, d, problem)
+            lines = path_to_lines(submission_path)
+            score = main(ip, port, sid, token, lines, problem)
             print(submission_path)
             print(score)
 

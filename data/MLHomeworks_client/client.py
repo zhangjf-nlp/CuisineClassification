@@ -62,7 +62,7 @@ def main(ip="115.236.52.125", port="4000", sid=SID, token=TOKEN,
     url = "http://%s:%s/jsonrpc" % (ip, port)
     
     global last_post_time
-    if time.time() - last_post_time < 1:
+    while time.time() - last_post_time < 1:
         time.sleep(1)
     payload = {
         "method": problem,
@@ -80,6 +80,7 @@ def main(ip="115.236.52.125", port="4000", sid=SID, token=TOKEN,
     if verbose: print(response)
     if "auth_error" in response:
         print("您的认证信息有误")
+        print(response["auth_error"])
         return response["auth_error"]
     elif "error" not in response:
         if verbose: print("测试完成，请查看分数")
@@ -162,8 +163,18 @@ class GeneticAlgorithm4Submission:
             if score > self.best_score:
                 print(f"update best score: {self.best_score:.8f} -> {score:.8f}")
                 print(f"through: {weight}")
+                
+                old_best_score = self.best_score
+                
                 self.best_score = score
                 self.best_lines = weighted_lines
+                
+                with open(f"./{old_best_score:.8f}_submission.txt", "w") as f:
+                    f.write("\n".join([line for line in self.best_lines]))
+                torch.save(self.bert_logits, f"./{old_best_score:.8f}_logits.pt")
+                os.system(f"mv {old_best_score:.8f}_submission.txt {self.best_score:.8f}_submission.txt")
+                os.system(f"mv {old_best_score:.8f}_logits.pt {self.best_score:.8f}_logits.pt")
+                
             self.caches.append((weight, score))
         self.update()
     

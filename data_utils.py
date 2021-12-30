@@ -70,25 +70,25 @@ def create_dataloader(args, root="./data", usage="train", tokenizer=None, erase=
             torch.tensor([tokenizer.encode(" [SEP] ".join(data[id]['ingredients']), truncation=True,
                                            max_length=args.max_length, padding="max_length") for id in data]).long(),
             torch.tensor([all_cuisine.index(data[id]['cuisine']) for id in data]
-                         if usage in ["train","eval"] else [0]*len(data)).long()
+                         if usage in ["train","eval","train_origin"] else [0]*len(data)).long()
         )
         if not os.path.exists(os.path.dirname(dataset_file_path)):
             os.makedirs(os.path.dirname(dataset_file_path))
         torch.save(dataset, dataset_file_path)
     
-    if args.bias_sampling and usage in ["train","eval"]:
+    if args.bias_sampling and usage in ["train","eval","train_origin"]:
         cuisine_weights = {cuisine:1/np.sqrt(all_cuisine_count[cuisine]) for cuisine in all_cuisine_count}
         weights = [cuisine_weights[data[id]['cuisine']] for id in read_data(f"{root}/{usage}.json")]
         assert len(weights)==len(dataset)
         sampler = WeightedRandomSampler(weights, len(weights))
     else:
-        sampler = RandomSampler(dataset) if usage=="train" else SequentialSampler(dataset)
+        sampler = RandomSampler(dataset) if usage in ["train","train_origin"] else SequentialSampler(dataset)
         
     dataloader = torch.utils.data.DataLoader(
         dataset = dataset,
         sampler = sampler,
         batch_size = args.batch_size,
-        drop_last = True if usage=="train" else False
+        drop_last = True if usage in ["train","train_origin"] else False
     )
     return dataloader
 

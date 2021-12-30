@@ -1,5 +1,5 @@
 # CuisineClassification
-The homework of ML-2021-BUAA. A project for bag-of-word classification.
+The homework of ML-2021-BUAA. A project for bag-of-phrase classification.
 
 ## Step 0. setup environment
 ```
